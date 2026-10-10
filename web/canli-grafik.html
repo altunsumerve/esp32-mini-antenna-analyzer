@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Anten Canlı Grafik</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#666;--line:#ddd;--panel:#f5f5f5;--grid:#e6e6e6;--green:#1a9e4b;--red:#d33;--yellow:#c99700;--btn:#0b62c4}
+@media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#e8e8e8;--muted:#aaa;--line:#3a3a3a;--panel:#222;--grid:#2c2c2c;--green:#3ddc84;--red:#ff6b6b;--yellow:#ffd54a;--btn:#4a9dff}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif;max-width:1000px;margin:0 auto;padding:16px}
+h1{font-size:1.4em;margin:0 0 4px}
+.hint{color:var(--muted);margin:0 0 12px;font-size:.92em}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--fg);cursor:pointer}
+button.primary{background:var(--btn);border-color:var(--btn);color:#fff}
+button.on{outline:3px solid var(--green)}
+button:disabled{opacity:.4;cursor:default}
+details{margin:6px 0 10px;color:var(--muted)}
+details label{display:inline-block;margin:6px 12px 0 0;color:var(--fg)}
+input{font:inherit;width:6.5em;padding:3px 6px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px}
+#status{font-size:.92em;color:var(--muted);margin-bottom:6px}
+#big{font-size:2.2em;font-weight:700;margin:4px 0;min-height:1.3em;font-variant-numeric:tabular-nums}
+#sub{color:var(--muted);min-height:1.4em}
+canvas{width:100%;height:360px;display:block;background:var(--panel);border-radius:10px;margin:8px 0}
+pre{background:var(--panel);border-radius:8px;padding:8px;font-size:12px;max-height:180px;overflow:auto;white-space:pre-wrap;margin:0}
+.warn{background:#fff3cd;color:#5c4500;padding:8px 12px;border-radius:8px;margin-bottom:10px;display:none}
+</style>
+</head>
+<body>
+<h1>Anten canlı grafik</h1>
+<p class="hint">Chrome veya Edge ile aç. Arduino seri ekranı <b>kapalı</b> olsun (portu aynı anda tek program kullanabilir).</p>
+<div class="warn" id="warn">Bu tarayıcı USB seri bağlantıyı desteklemiyor. Lütfen sayfayı <b>Chrome</b> veya <b>Edge</b> ile aç.</div>
+
+<div class="bar">
+  <button id="bConnect" class="primary">1) ESP32'ye bağlan</button>
+  <button id="bScan" disabled>⛰️ Tarama</button>
+  <button id="bListen" disabled>📱 Telefonu dinle</button>
+  <button id="bStop" disabled>■ Durdur</button>
+  <button id="bClear">Tepeleri sil</button>
+</div>
+<div class="bar" style="align-items:center">
+  <label><input type="checkbox" id="cAvg" checked style="width:auto"> Son 8 taramanın ortalaması</label>
+  <button id="bRef">Referans kaydet</button>
+  <label><input type="checkbox" id="cRef" style="width:auto"> Referansı çıkar</label>
+</div>
+
+<details>
+  <summary>Tarama aralığı (6–8 MHz arası)</summary>
+  <label>Başlangıç MHz <input id="iStart" type="number" step="0.01" value="7.0"></label>
+  <label>Bitiş MHz <input id="iEnd" type="number" step="0.01" value="8.0"></label>
+  <label>Adım kHz <input id="iStep" type="number" step="1" value="20"></label>
+</details>
+
+<div id="status">Bağlı değil.</div>
+<div id="big">—</div>
+<div id="sub"></div>
+<canvas id="cv"></canvas>
+<pre id="log"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+let port = null, writer = null, mode = 'idle';
+let sweep = null, hold = null, holdStart = 0, holdStep = 0;
+let listenMax = [], listenMean = [];
+const LISTEN_N = 300;
+const AVG_N = 8;
+let avgBuf = [], avgKey = '', ref = null, lastAvg = null;
+
+if (!('serial' in navigator)) { $('warn').style.display = 'block'; $('bConnect').disabled = true; }
+
+function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function log(s){
+  const el = $('log');
+  el.textContent += s + '\n';
+  const lines = el.textContent.split('\n');
+  if (lines.length > 60) el.textContent = lines.slice(-60).join('\n');
+  el.scrollTop = el.scrollHeight;
+}
+function setMode(m){
+  mode = m;
+  $('bScan').classList.toggle('on', m === 'scan');
+  $('bListen').classList.toggle('on', m === 'listen');
+  draw();
+}
+
+async function send(cmd){
+  if (!writer) return;
+  await writer.write(new TextEncoder().encode(cmd + '\n'));
+  log('> ' + cmd);
+}
+
+$('bConnect').onclick = async () => {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    $('status').textContent = 'Bağlandı. ESP32 yeniden başlıyor olabilir, READY yazısını bekle…';
+    ['bScan','bListen','bStop'].forEach(b => $(b).disabled = false);
+    $('bConnect').disabled = true;
+    readLoop();
+  } catch (e) { $('status').textContent = 'Bağlanamadı: ' + e.message; }
+};
+
+async function readLoop(){
+  const reader = port.readable.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).replace(/\r$/, '');
+        buf = buf.slice(i + 1);
+        handle(line);
+      }
+    }
+  } catch (e) {
+    $('status').textContent = 'Bağlantı koptu: ' + e.message + ' — sayfayı yenileyip tekrar bağlan.';
+  }
+}
+
+function handle(line){
+  if (!line) return;
+  if (line.startsWith('L,')) { onSweep(line); return; }
+  if (line.startsWith('R,')) { onListen(line); return; }
+  log(line);
+  if (line.includes('READY')) $('status').textContent = 'Hazır ✅ Şimdi ⛰️ Tarama ya da 📱 Telefonu dinle.';
+  if (line.includes('ERROR')) $('status').textContent = '⚠️ ' + line;
+  if (line.includes('AUTO OFF') || line.includes('OFF requested')) { setMode('idle'); $('status').textContent = 'Durdu (verici kapalı).'; }
+}
+
+function onSweep(line){
+  const p = line.split(',');
+  const start = +p[1], step = +p[2];
+  const raw = p.slice(3).map(Number).filter(v => !isNaN(v));
+  if (!raw.length) return;
+  // keep only complete sweeps of the same shape for averaging
+  const key = start + '/' + step + '/' + raw.length;
+  if (key !== avgKey) { avgBuf = []; avgKey = key; ref = null; $('bRef').textContent = 'Referans kaydet'; }
+  avgBuf.push(raw);
+  const N = $('cAvg').checked ? AVG_N : 1;
+  while (avgBuf.length > N) avgBuf.shift();
+  let vals = raw.map((_, k) => avgBuf.reduce((s, a) => s + a[k], 0) / avgBuf.length);
+  lastAvg = vals.slice();
+  if (ref && $('cRef').checked) vals = vals.map((v, k) => v - ref[k]);
+  if (!hold || holdStart !== start || holdStep !== step || hold.length !== vals.length) {
+    hold = vals.slice(); holdStart = start; holdStep = step;
+  } else {
+    for (let k = 0; k < vals.length; k++) hold[k] = Math.max(hold[k], vals[k]);
+  }
+  sweep = { start, step, vals };
+  let bi = 0;
+  vals.forEach((v, k) => { if (v > vals[bi]) bi = k; });
+  const f = (start + bi * step) / 1e6;
+  $('big').textContent = f.toFixed(3) + ' MHz';
+  let note = 'En yüksek nokta · fark = ' + Math.round(vals[bi]);
+  if (bi === 0 || bi === vals.length - 1) note += ' · ⚠️ kenarda: düğmeyi çevir ya da aralığı değiştir';
+  if (vals[bi] < 30) note += ' · sinyal çok zayıf';
+  $('sub').textContent = note;
+  if (mode !== 'scan') setMode('scan'); else draw();
+}
+
+function onListen(line){
+  const p = line.split(',');
+  const mean = +p[1], mx = +p[2];
+  listenMean.push(mean); listenMax.push(mx);
+  if (listenMax.length > LISTEN_N) { listenMax.shift(); listenMean.shift(); }
+  $('big').textContent = 'Seviye: ' + mx;
+  $('sub').textContent = 'Ortalama ' + Math.round(mean) + ' · telefonu yaklaştırıp uzaklaştır, düğmeyi yavaş çevir';
+  if (mode !== 'listen') setMode('listen'); else draw();
+}
+
+$('bScan').onclick = async () => {
+  const a = Math.round(parseFloat($('iStart').value) * 1e6);
+  const b = Math.round(parseFloat($('iEnd').value) * 1e6);
+  const c = Math.round(parseFloat($('iStep').value) * 1e3);
+  const ok = a >= 6e6 && b <= 8e6 && a < b && c >= 100 && (b - a) % c === 0 && (b - a) / c + 1 <= 401;
+  if (!ok) { $('status').textContent = '⚠️ Aralık geçersiz: 6–8 MHz içinde olmalı, (bitiş−başlangıç) adıma tam bölünmeli, en çok 401 nokta.'; return; }
+  hold = null; sweep = null;
+  setMode('scan');
+  $('status').textContent = 'Tarama çalışıyor (5 dk sonra kendiliğinden durur). Düğmeyi yavaşça çevir, dağ kaymalı.';
+  await send(`live ${a} ${b} ${c}`);
+};
+$('bListen').onclick = async () => {
+  listenMax = []; listenMean = [];
+  setMode('listen');
+  $('status').textContent = 'Dinleniyor, verici KAPALI. Anahtar "330 YOK" tarafında olmalı.';
+  await send('listen');
+};
+$('bStop').onclick = async () => { await send('off'); setMode('idle'); $('status').textContent = 'Durduruldu (verici kapalı).'; };
+$('bClear').onclick = () => { hold = null; avgBuf = []; listenMax = []; listenMean = []; draw(); };
+$('bRef').onclick = () => {
+  if (!lastAvg) { $('status').textContent = 'Önce birkaç tarama yapılmalı.'; return; }
+  ref = lastAvg.slice(); hold = null;
+  $('cRef').checked = true;
+  $('bRef').textContent = 'Referans kaydedildi ✓';
+  $('status').textContent = 'Referans kaydedildi. Şimdi anahtarı "330 VAR" yap; grafik referanstan farkı gösterir.';
+};
+$('cRef').onchange = () => { hold = null; };
+$('cAvg').onchange = () => { avgBuf = []; hold = null; };
+window.addEventListener('beforeunload', () => { try { writer && writer.write(new TextEncoder().encode('off\n')); } catch(e){} });
+
+function niceStep(range, n){
+  const raw = range / n, pow = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw / pow;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * pow;
+}
+
+function draw(){
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const L = 56, R = 12, T = 12, B = 34;
+  const pw = W - L - R, ph = H - T - B;
+  ctx.font = '12px system-ui, sans-serif';
+
+  let series = [], xs, xmin, xmax, xlabel;
+  if (mode === 'listen' && listenMax.length) {
+    xmin = 0; xmax = LISTEN_N - 1; xlabel = 'zaman (son ~30 sn)';
+    xs = k => k + (LISTEN_N - listenMax.length);
+    series.push({ v: listenMean, c: css('--muted'), w: 1.5 });
+    series.push({ v: listenMax, c: css('--yellow'), w: 2.5 });
+  } else if (sweep) {
+    xmin = sweep.start / 1e6; xmax = (sweep.start + (sweep.vals.length - 1) * sweep.step) / 1e6; xlabel = 'frekans (MHz)';
+    xs = k => (sweep.start + k * sweep.step) / 1e6;
+    if (hold) series.push({ v: hold, c: css('--red'), w: 1.5, a: 0.4 });
+    series.push({ v: sweep.vals, c: css('--green'), w: 2.5 });
+  } else {
+    ctx.fillStyle = css('--muted');
+    ctx.textAlign = 'center';
+    ctx.fillText('Bağlan, sonra ⛰️ Tarama ya da 📱 Telefonu dinle', W / 2, H / 2);
+    return;
+  }
+
+  let ymin = Infinity, ymax = -Infinity;
+  series.forEach(s => s.v.forEach(v => { ymin = Math.min(ymin, v); ymax = Math.max(ymax, v); }));
+  ymax = Math.max(ymax, ymin + 50);
+  const pad = (ymax - ymin) * 0.08; ymax += pad; ymin -= pad;
+  const X = x => L + (x - xmin) / (xmax - xmin || 1) * pw;
+  const Y = y => T + ph - (y - ymin) / (ymax - ymin) * ph;
+
+  ctx.strokeStyle = css('--grid'); ctx.fillStyle = css('--muted'); ctx.lineWidth = 1;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  const ys = niceStep(ymax - ymin, 5);
+  for (let y = Math.ceil(ymin / ys) * ys; y <= ymax; y += ys) {
+    ctx.beginPath(); ctx.moveTo(L, Y(y)); ctx.lineTo(L + pw, Y(y)); ctx.stroke();
+    ctx.fillText(Math.round(y), L - 6, Y(y));
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  if (mode !== 'listen') {
+    const xsStep = niceStep(xmax - xmin, 6);
+    for (let x = Math.ceil(xmin / xsStep) * xsStep; x <= xmax + 1e-9; x += xsStep) {
+      ctx.beginPath(); ctx.moveTo(X(x), T); ctx.lineTo(X(x), T + ph); ctx.stroke();
+      ctx.fillText(x.toFixed(xsStep < 0.1 ? 2 : 1), X(x), T + ph + 4);
+    }
+  }
+  ctx.fillText(xlabel, L + pw / 2, T + ph + 18);
+  ctx.save(); ctx.translate(12, T + ph / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = 'middle';
+  ctx.fillText(mode === 'listen' ? 'dedektör seviyesi' : 'ADC farkı (ham)', 0, 0); ctx.restore();
+
+  series.forEach(s => {
+    ctx.globalAlpha = s.a || 1; ctx.strokeStyle = s.c; ctx.lineWidth = s.w; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    s.v.forEach((v, k) => { const px = X(xs(k)), py = Y(v); k ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+    ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+}
+window.addEventListener('resize', draw);
+draw();
+</script>
+</body>
+</html>
